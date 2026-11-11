@@ -497,3 +497,153 @@ def test_ui_colours_and_fonts_go_through_tokens():
 def test_ui_expects_this_version():
     # 页面每次请求现读，程序要重启才换新；页面靠这个版本号发现"程序还是旧的"，所以两边必须一起改
     assert re.search(r'const WANT = "([^"]+)"', UI).group(1) == w.VERSION
+
+
+# ---------------- 桌面 / 程序坞图标（温故.app）----------------
+import os
+import plistlib
+import socket
+import subprocess
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import Thread
+
+
+APP = w.ROOT / "温故.app"
+LAUNCHER = APP / "Contents" / "MacOS" / "wengu"
+
+
+def test_app_bundle_is_well_formed():
+    info = plistlib.loads((APP / "Contents" / "Info.plist").read_bytes())
+    assert APP / "Contents" / "MacOS" / info["CFBundleExecutable"] == LAUNCHER
+    assert os.access(LAUNCHER, os.X_OK)
+    assert info["CFBundlePackageType"] == "APPL"
+    assert info["CFBundleShortVersionString"] == w.VERSION
+    icon = APP / "Contents" / "Resources" / (info["CFBundleIconFile"] + ".icns")
+    assert icon.read_bytes()[:4] == b"icns"
+    install = (w.ROOT / "install.sh").read_text("utf-8")
+    assert info["CFBundleIdentifier"] in install
+    for f in (LAUNCHER, w.ROOT / "install.sh", w.ROOT / "温故.command"):
+        subprocess.run(["bash", "-n", str(f)], check=True)
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+PING_SERVER = """
+import sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200); self.end_headers(); self.wfile.write(b'{"app": "wengu"}')
+    def log_message(self, *a): pass
+HTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+"""
+
+UV_MODES = {
+    "serve": 'echo $$ > "$FAKE_PID"; exec python3 -c "$FAKE_SERVER" "$FAKE_PORT"\n',
+    "die": 'echo "端口 8737 被别的程序占用了。关掉占用它的程序，或者重启电脑后再试。"; exit 1\n',
+    "slow": 'echo $$ > "$FAKE_PID"; exec sleep 30\n',
+}
+
+
+def _run_launcher(tmp_path, uv_mode="serve", wait="20", button="", has_wengu=True):
+    """在假的 macOS 环境里跑图标启动器：open / osascript / uv 都换成记录调用的替身。"""
+    home = tmp_path / "home"
+    (home / "温故").mkdir(parents=True)
+    if has_wengu:
+        (home / "温故" / "wengu.py").write_text("")
+    fakes = home / ".local" / "bin"  # 启动器会把它放在 PATH 最前面
+    fakes.mkdir(parents=True)
+    calls = tmp_path / "calls.txt"
+    calls.write_text("")
+    for name, body in {
+        "open": 'echo "open $*" >> "$FAKE_CALLS"\n',
+        "osascript": 'cat >/dev/null; echo "osascript $*" >> "$FAKE_CALLS"; echo "$FAKE_BUTTON"\n',
+        "uv": 'echo "uv $*" >> "$FAKE_CALLS"\n' + UV_MODES[uv_mode],
+    }.items():
+        (fakes / name).write_text("#!/bin/bash\n" + body)
+        (fakes / name).chmod(0o755)
+    port = _free_port()
+    env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+    env.update(HOME=str(home), WENGU_URL=f"http://127.0.0.1:{port}/", WENGU_WAIT=wait,
+               FAKE_CALLS=str(calls), FAKE_PID=str(tmp_path / "pid"), FAKE_PORT=str(port),
+               FAKE_SERVER=PING_SERVER, FAKE_BUTTON=button)
+    return env, port, calls, home
+
+
+def _kill(tmp_path):
+    pid = tmp_path / "pid"
+    if pid.exists():
+        try:
+            os.kill(int(pid.read_text()), 9)
+        except ProcessLookupError:
+            pass
+
+
+def test_launcher_opens_page_when_already_running(tmp_path):
+    env, port, calls, _ = _run_launcher(tmp_path)
+
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"app": "wengu"}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), H)
+    Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        r = subprocess.run(["bash", str(LAUNCHER)], env=env, timeout=20)
+    finally:
+        srv.shutdown()
+    assert r.returncode == 0
+    assert calls.read_text().split("\n")[0] == f"open http://127.0.0.1:{port}/"
+    assert "uv " not in calls.read_text()
+
+
+def test_launcher_starts_wengu_in_background(tmp_path):
+    env, port, calls, home = _run_launcher(tmp_path, "serve")
+    try:
+        t = time.time()
+        r = subprocess.run(["bash", str(LAUNCHER)], env=env, timeout=30)
+        assert r.returncode == 0 and time.time() - t < 15
+        log = calls.read_text()
+        assert "uv run --quiet -P yt-dlp wengu.py" in log
+        assert "open " not in log and "osascript" not in log  # 页面由温故自己打开，不弹窗
+        assert (home / "温故" / ".cache" / "启动记录.txt").exists()
+    finally:
+        _kill(tmp_path)
+
+
+def test_launcher_explains_why_it_could_not_start(tmp_path):
+    env, _, calls, home = _run_launcher(tmp_path, "die", button="用终端打开")
+    r = subprocess.run(["bash", str(LAUNCHER)], env=env, timeout=30)
+    log = calls.read_text()
+    assert r.returncode == 1
+    assert "uv run --quiet --offline wengu.py" in log  # 联网更新失败会改用现有版本再试一次
+    assert "温故没能打开" in log and "端口 8737 被别的程序占用了" in log
+    assert f"open -a Terminal {home}/温故/温故.command" in log
+
+
+def test_launcher_tells_you_when_first_start_is_slow(tmp_path):
+    env, _, calls, _ = _run_launcher(tmp_path, "slow", wait="2")
+    try:
+        r = subprocess.run(["bash", str(LAUNCHER)], env=env, timeout=30)
+        assert r.returncode == 0
+        assert "温故正在准备" in calls.read_text()
+    finally:
+        _kill(tmp_path)
+
+
+def test_launcher_without_wengu_says_to_reinstall(tmp_path):
+    env, _, calls, _ = _run_launcher(tmp_path, has_wengu=False)
+    r = subprocess.run(["bash", str(LAUNCHER)], env=env, timeout=20)
+    assert r.returncode == 1
+    assert "找不到温故" in calls.read_text()
+    assert "uv " not in calls.read_text()
