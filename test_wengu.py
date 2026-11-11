@@ -647,3 +647,84 @@ def test_launcher_without_wengu_says_to_reinstall(tmp_path):
     assert r.returncode == 1
     assert "找不到温故" in calls.read_text()
     assert "uv " not in calls.read_text()
+
+
+# ---------------- 一行安装（install.sh）----------------
+import tarfile
+
+
+def _run_install(tmp_path, sys_apps=True, runs=1, before=None):
+    """在假的 macOS 环境里跑 install.sh：下载换成本地打包的源码，uv / defaults / open 等换成记录调用的替身。"""
+    home = tmp_path / "home"
+    fakes = home / ".local" / "bin"
+    fakes.mkdir(parents=True)
+    tgz = tmp_path / "main.tar.gz"
+    skip = {"输入", "输出", ".cache", "__pycache__", ".pytest_cache", ".git"}
+    with tarfile.open(tgz, "w:gz") as t:
+        for p in sorted(w.ROOT.rglob("*")):
+            rel = p.relative_to(w.ROOT)
+            if not skip & set(rel.parts) and p.is_file():
+                t.add(p, f"wengu-main/{rel}")
+    calls, dock = tmp_path / "calls.txt", tmp_path / "dock.txt"
+    calls.write_text("")
+    for name, body in {
+        "uname": 'echo Darwin\n',
+        "curl": 'case "$*" in *main.tar.gz*) cat "$FAKE_TGZ";; *api/ping*) exit 7;; *) echo "curl $*" >> "$FAKE_CALLS"; exit 1;; esac\n',
+        "uv": 'echo "uv $*" >> "$FAKE_CALLS"\n',
+        "defaults": 'case "$1" in export) cat "$FAKE_DOCK" 2>/dev/null;; write) echo "$5" >> "$FAKE_DOCK";; esac\n',
+        "killall": 'echo "killall $*" >> "$FAKE_CALLS"\n',
+        "open": 'echo "open $*" >> "$FAKE_CALLS"\n',
+        "ditto": 'cp -R "$1" "$2"\n',
+    }.items():
+        (fakes / name).write_text("#!/bin/bash\n" + body)
+        (fakes / name).chmod(0o755)
+    apps = tmp_path / "Applications"
+    if sys_apps:
+        apps.mkdir()
+    (home / "Desktop").mkdir()
+    if before:
+        before(home)
+    env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+    env.update(HOME=str(home), PATH=f"{fakes}:/usr/bin:/bin", WENGU_SYS_APPS=str(apps),
+               FAKE_TGZ=str(tgz), FAKE_CALLS=str(calls), FAKE_DOCK=str(dock))
+    for _ in range(runs):
+        r = subprocess.run(["bash", str(w.ROOT / "install.sh")], env=env, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, r.stdout + r.stderr
+    return home, apps, calls.read_text(), (dock.read_text() if dock.exists() else "")
+
+
+def test_install_puts_icon_in_applications_desktop_and_dock(tmp_path):
+    home, apps, calls, dock = _run_install(tmp_path)
+    app = apps / "温故.app"
+    for a in (app, home / "Desktop" / "温故.app"):
+        assert os.access(a / "Contents" / "MacOS" / "wengu", os.X_OK)
+        assert (a / "Contents" / "Resources" / "AppIcon.icns").exists()
+    assert (home / "温故" / "wengu.py").exists()
+    assert "uv sync --script wengu.py" in calls          # 组件在安装时装好
+    assert f"<string>{app}</string>" in dock and "killall Dock" in calls
+    assert calls.strip().endswith(f"open {app}")           # 最后打开的是「应用程序」里那份
+
+
+def test_install_twice_does_not_add_a_second_dock_icon(tmp_path):
+    home, apps, _, dock = _run_install(tmp_path, runs=2)
+    assert dock.count("tile-data") == 1
+    assert (apps / "温故.app").exists() and (home / "Desktop" / "温故.app").exists()
+
+
+def test_install_without_admin_uses_personal_applications(tmp_path):
+    home, apps, calls, dock = _run_install(tmp_path, sys_apps=False)
+    app = home / "Applications" / "温故.app"
+    assert app.exists() and not apps.exists()
+    assert f"<string>{app}</string>" in dock and calls.strip().endswith(f"open {app}")
+
+
+def test_install_leaves_other_things_on_the_desktop_alone(tmp_path):
+    def before(home):
+        mine = home / "Desktop" / "温故.app" / "Contents"
+        mine.mkdir(parents=True)
+        (mine / "Info.plist").write_text("someone else's app")
+        (home / "Desktop" / "温故.command").write_text('#!/bin/bash\nexec "/Users/x/温故/温故.command"\n')
+    home, apps, _, _ = _run_install(tmp_path, before=before)
+    assert (home / "Desktop" / "温故.app" / "Contents" / "Info.plist").read_text() == "someone else's app"
+    assert not (home / "Desktop" / "温故.command").exists()  # 旧版放的启动器换掉了
+    assert (apps / "温故.app").exists()
