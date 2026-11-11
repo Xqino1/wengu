@@ -7,6 +7,15 @@ DST="$HOME/projects/wengu"
 export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.homebrew/bin:$HOME/.local/bin:$PATH"
 pause() { echo; read -n 1 -s -r -p "按任意键关闭窗口"; }
 
+# 发布是把这个文件夹原样同步上去：这里少了的文件，GitHub 上也会被删掉。缺了关键文件就不发
+REQUIRED=(wengu.py ui.html install.sh 温故.command 温故.app/Contents/Info.plist 温故.app/Contents/MacOS/wengu 温故.app/Contents/Resources/AppIcon.icns)
+for f in "${REQUIRED[@]}"; do
+  if [ ! -e "$SRC/$f" ]; then
+    echo "这个文件夹里缺了「$f」，已取消发布（发出去会把它从 GitHub 上删掉，别人就装不上了）。"
+    pause; exit 1
+  fi
+done
+
 mkdir -p "$DST"
 rsync -a --delete --exclude .git --exclude .cache --exclude 输入 --exclude 输出 --exclude 使用说明.md \
   --exclude .DS_Store --exclude __pycache__ --exclude .pytest_cache "$SRC/" "$DST/"

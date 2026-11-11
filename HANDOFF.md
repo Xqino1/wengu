@@ -37,7 +37,8 @@
 - 图标：一对中文引号「」框住一段话，中间那行被荧光笔划过。按苹果 macOS 图标网格画（1024 画布、824 圆角方块、连续曲率圆角 r=185.4），方块外没有任何像素、方块内不透明，否则 macOS 26 会把它缩小关进灰框。16/32px 用去掉上下两行字的简化版。源文件和生成脚本在 `scripts/图标/`（`python3 scripts/图标/生成图标.py` 重新生成 SVG 和 `AppIcon.icns`，需要 rsvg-convert 和 Pillow）。页面标签上的小图标是内嵌在 `ui.html` 里的同一个 SVG。
 - `温故.command`：终端版启动器，没有 uv 会自动装。现在只在图标启动失败、或者想看详细输出时用。
 - `install.sh`：一行安装，装到 `~/温故`。顺序：装 uv → 下载 → `uv sync --script wengu.py` 预装组件（约 1GB，装不完不中断，第一次打开时接着装）→ 把 `温故.app` 拷进 `/Applications`（不可写就放 `~/Applications`）和桌面，都只替换自己放的（认 Bundle ID），顺手删掉旧版放的 `温故.command` → 第一次安装时把「应用程序」里那份加进程序坞（`defaults write com.apple.dock persistent-apps` + `killall Dock`，用 `.cache/已加到程序坞` 记住，用户拖走后重装不再加）→ 打开。里面的 `__GITHUB_USER__` 由发布脚本替换。
-- `scripts/发布到GitHub.command`：复制到 `~/projects/wengu` 再推送，避开 iCloud 桌面。
+- `scripts/发布到GitHub.command`：把所在的文件夹原样同步到 `~/projects/wengu`（带 git，登录过 GitHub）再推送。**原样同步的意思是：源码里少了的文件，GitHub 上也会被删掉**，所以它先检查 `REQUIRED` 里的关键文件，缺了就不发。
+- 开发副本：11 月 12 日起就是 `~/温故`（不在 iCloud 里），在 `~/温故/scripts/` 里双击发布。注意重新运行安装命令会用 GitHub 上的版本覆盖 `~/温故` 的代码，所以改完要先发布再重装。
 - `test_wengu.py`：38 个离线测试。界面 4 个（只调用服务端有的接口、不引用外部资源、颜色字体走变量、页面里的版本号和 `VERSION` 一致）；图标 6 个（.app 结构和版本号；启动器在假的 macOS 命令下的五种情况：已开着、后台启动、启动失败、启动慢、找不到温故）；安装 4 个（在假的 macOS 环境里整个跑 `install.sh`：首次安装、装两次不重复加程序坞、不能写 `/Applications` 时改放 `~/Applications`、不动桌面上别人的「温故」）。`install.sh` 里的 `WENGU_SYS_APPS` 只给测试用。
 
 ## 已验证
@@ -58,6 +59,7 @@
 5. 提取进行中的界面只用模拟数据看过，没有跟着一次真实提取从头看到尾。
 
 ## 已知的坑
+- **11 月 12 日 GitHub 上的 `温故.app` 被删过一次。** 06:21 发布时还在，之后源码文件夹里的 `温故.app` 不见了，06:37 那次发布就把它从仓库里删了，安装命令在第 ② 步报 `chmod: …wengu: No such file or directory`。随后 Kerry 把桌面上的源码文件夹整个扔进了废纸篓，想模拟从零下载（`输出/` 里 MIT 那门课的复习包也在里面）。修法：把完整源码写进 `~/温故` 再从那里发布；发布脚本和安装命令都加了检查。
 - **更新文件以后要退出再打开温故。** 11 月 12 日这次就是：Kerry 的 Mac 上跑着的还是 v0.3 启动的那一次（`/api/state` 报 0.3.0，`/api/pack` 没有 `extras`、`has_review`），新页面一打开就报错。现在页面会直接提示重开。
 - **Kerry 那台机器上「跳转卡一下」是 iCloud 造成的。** 他的副本在 `~/Desktop/温故`，桌面由 iCloud 同步，文件会被挪到云端；量出来每份文档第一次读 1.7 秒左右（等 iCloud 下回来），第二次 20 毫秒。`warm()` 会提前把文件读回来，所以现在大多数时候感觉不到，但根治办法是把文件夹搬到 `~/温故`。朋友用安装命令装在 `~/温故`，不会遇到。
 - YouTube 没字幕的视频要下载音频，需要 Deno 解 JS 验证；现在 Deno 通过 PyPI 的 `deno` 包随依赖安装。

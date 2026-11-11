@@ -28,6 +28,10 @@ fi
 echo "② 下载温故到 $DEST …"
 mkdir -p "$DEST"
 curl -fsSL "https://github.com/$REPO/archive/refs/heads/main.tar.gz" | tar -xz -C "$DEST" --strip-components=1
+if [ ! -f "$SRC_APP/Contents/MacOS/wengu" ]; then
+  echo "下载下来的温故不完整（少了 温故.app）。过几分钟再试一次；还不行就告诉发给你这个命令的人。"
+  exit 1
+fi
 chmod +x "$DEST/温故.command" "$SRC_APP/Contents/MacOS/wengu"
 
 echo "③ 准备组件（第一次约 1GB，要几分钟；以后打开就快了）…"

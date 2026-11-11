@@ -728,3 +728,15 @@ def test_install_leaves_other_things_on_the_desktop_alone(tmp_path):
     assert (home / "Desktop" / "温故.app" / "Contents" / "Info.plist").read_text() == "someone else's app"
     assert not (home / "Desktop" / "温故.command").exists()  # 旧版放的启动器换掉了
     assert (apps / "温故.app").exists()
+
+
+def test_publish_refuses_to_publish_without_the_files_installs_need():
+    # 发布脚本原样同步文件夹：少了文件就会从 GitHub 上删掉（11 月 12 日 温故.app 就这样被删过一次）
+    script = (w.ROOT / "scripts" / "发布到GitHub.command").read_text("utf-8")
+    required = re.search(r"REQUIRED=\(([^)]*)\)", script).group(1).split()
+    install = (w.ROOT / "install.sh").read_text("utf-8")
+    assert "wengu.py" in required and "温故.app/Contents/MacOS/wengu" in required
+    for f in required:
+        assert (w.ROOT / f).exists(), f
+    assert script.index("REQUIRED=") < script.index("rsync ")
+    assert 'SRC_APP/Contents/MacOS/wengu" ]' in install
