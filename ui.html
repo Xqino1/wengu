@@ -331,6 +331,16 @@ dialog .go{justify-content:flex-end}
 .pop .seg button{flex:1;padding:0 var(--space-2xs)}
 .toast{position:fixed;left:50%;bottom:var(--space-lg);z-index:var(--z-toast);padding:var(--space-xs) var(--space-md);border-radius:var(--radius-pill);background:var(--color-toast);color:var(--color-toast-ink);font-size:var(--text-sm);font-weight:500;opacity:0;transform:translate(-50%,10px) scale(.96);pointer-events:none;-webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);transition:opacity var(--dur-short),transform var(--dur-short) var(--ease-out)}
 .toast.on{opacity:1;transform:translate(-50%,0)}
+.toast.act.on{pointer-events:auto}
+.toast-act{margin-left:var(--space-sm);padding:0 0 0 var(--space-sm);border:0;border-left:1px solid currentColor;background:none;color:inherit;font:inherit;font-weight:600;cursor:pointer}
+.toast-act:hover{text-decoration:underline}
+.btn.danger{color:var(--color-error)}
+.btn.danger:hover,.btn.warn:hover{background:var(--color-error-soft);color:var(--color-error)}
+.btn.danger.sure{background:var(--color-error-soft);color:var(--color-error);font-weight:600}
+.trash-list{margin-top:var(--space-lg);border-top:1px solid var(--color-rule)}
+.trash-row{display:flex;flex-wrap:wrap;align-items:center;gap:var(--space-xs) var(--space-sm);padding:var(--space-sm) 0;border-bottom:1px solid var(--color-rule)}
+.trash-row .grow{min-width:12rem}
+.trash-row .pk-s{margin-top:var(--space-3xs)}
 .net{position:fixed;left:50%;bottom:var(--space-2xl);z-index:var(--z-toast);transform:translateX(-50%);width:max-content;max-width:92vw;margin:0}
 
 /* 阅读 */
@@ -461,7 +471,7 @@ dialog .go{justify-content:flex-end}
 <script>
 "use strict";
 const $main = document.getElementById("main"), $lib = document.getElementById("lib"), $side = document.getElementById("side");
-const WANT = "0.4.0";   // 和 wengu.py 的 VERSION 对齐：页面是每次现读的，程序要重新打开才换新，两边对不上就提示重开
+const WANT = "0.4.1";   // 和 wengu.py 的 VERSION 对齐：页面是每次现读的，程序要重新打开才换新，两边对不上就提示重开
 const URL_RE = /https?:\/\/[^\s　，。！？、“”‘’（）()<>【】\[\]]+/g;
 const ICON = {
   plus:"M12 5v14M5 12h14", search:"M11 4a7 7 0 1 0 0 14a7 7 0 0 0 0-14zM21 21l-4.3-4.3",
@@ -471,7 +481,8 @@ const ICON = {
   print:"M7 9V4h10v5M7 18H4v-7h16v7h-3M7 14h10v6H7z", left:"M15 6l-6 6 6 6", right:"M9 6l6 6-6 6", down:"M6 9l6 6 6-6", up:"M6 15l6-6 6 6",
   check:"M5 12l5 5 9-10", x:"M6 6l12 12M18 6L6 18", menu:"M4 7h16M4 12h16M4 17h16", upload:"M12 16V5M7 10l5-5 5 5M5 19h14", power:"M12 4v8M7 7a7 7 0 1 0 10 0",
   save:"M5 4h11l3 3v13H5zM8 4v5h7M8 20v-6h8v6", play:"M8 5l11 7-11 7z", text:"M4 19l5-14h1l5 14M6 14h7M16 19l2.5-7h.5l2.5 7M17 17h4",
-  doc:"M7 3h8l4 4v14H7zM15 3v4h4M10 12h6M10 16h6"
+  doc:"M7 3h8l4 4v14H7zM15 3v4h4M10 12h6M10 16h6",
+  trash:"M4 7h16M9 7V4h6v3M6 7l1 13h10l1-13M10 11v6M14 11v6", undo:"M9 14L4 9l5-5M4 9h11a5 5 0 0 1 0 10h-4"
 };
 function icon(name){
   const s = document.createElementNS("http://www.w3.org/2000/svg", "svg");
@@ -498,14 +509,15 @@ async function api(path, body, raw){
   try {
     const r = await fetch(path, opt);
     const j = await r.json().catch(() => ({error: "温故没有回应"}));
-    if (!r.ok) throw new Error(j.error || "出错了");
+    if (!r.ok){ const err = new Error(j.error || "出错了"); err.status = r.status; throw err; }
     return j;
   } finally { clearTimeout(t); }
 }
-function toast(msg){
+function toast(msg, act){
   const t = document.getElementById("toast");
-  t.textContent = msg; t.classList.add("on");
-  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on"), 2200);
+  put(t, h("span", {}, msg), act ? h("button", {class: "toast-act", type: "button", onclick: () => { t.classList.remove("on", "act"); act.run(); }}, act.label) : null);
+  t.classList.toggle("act", !!act); t.classList.add("on");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("on", "act"), act ? 7000 : 2200);
 }
 async function copy(text, msg, b){
   try { await navigator.clipboard.writeText(text); }
@@ -639,7 +651,7 @@ const draft = {links: sessionStorage.getItem("wg_links") || "", name: sessionSto
 const pos = load("wg_pos", {});
 function route(){
   const parts = location.hash.replace(/^#\/?/, "").split("/").map(x => { try { return decodeURIComponent(x); } catch { return x; } });
-  const view = ["new", "pack", "read", "doc"].includes(parts[0]) ? parts[0] : "";
+  const view = ["new", "pack", "read", "doc", "trash"].includes(parts[0]) ? parts[0] : "";
   return {view, id: parts[1], a: parts[2], tab: parts[3], at: parts[4], rest: parts.slice(2).join("/")};
 }
 function applyPrefs(){
@@ -681,13 +693,14 @@ function renderSide(){
         oninput: e => { prefs.q = e.target.value.trim().toLowerCase(); renderSide(); }})));
     $lib.setAttribute("aria-label", p ? "这个复习包的材料" : "复习包");
   }
-  const sig = JSON.stringify([mode, location.hash, prefs.q, prefs.showArchived, [...prefs.closed], p ? p.items.map(i => [i.sid, i.has_review, i.has_guide]) : S.packs, p && p.extras]);
+  const sig = JSON.stringify([mode, location.hash, prefs.q, prefs.showArchived, [...prefs.closed], p ? p.items.map(i => [i.sid, i.has_review, i.has_guide]) : S.packs, p && p.extras, S.trash]);
   if (sig === sideSig) return; sideSig = sig;
   put($lib, p ? lecList(p, r) : libList(r));
   if (p) $lib.querySelector("[aria-current=page]")?.scrollIntoView({block: "nearest"});
   const archived = S.packs.filter(x => x.archived);
   put(document.getElementById("sidefoot"),
     !p && archived.length ? btn(prefs.showArchived ? "隐藏已归档" : `已归档 ${archived.length}`, "archive", {class: "btn quiet", onclick: () => { prefs.showArchived = !prefs.showArchived; renderSide(); }}) : null,
+    !p && (S.trash || r.view === "trash") ? h("a", {class: "btn quiet", href: "#/trash", "aria-current": r.view === "trash" ? "page" : null, title: "删掉的复习包在这里放 7 天"}, icon("trash"), `废纸篓${S.trash ? " " + S.trash : ""}`) : null,
     h("span", {class: "grow"}),
     btn("", "text", {class: "btn quiet icon", "aria-label": "显示设置", title: "显示设置", onclick: e => displayPop(e.currentTarget, false)}),
     btn("退出", "power", {class: "btn quiet", onclick: quit}));
@@ -893,7 +906,8 @@ function paintHead(p){
         lastIt ? h("a", {class: "btn", href: `#/read/${E(id)}/${lastIt.sid}/${last.tab}`}, icon("doc"), `接着读 ${lastIt.sid}`) : null,
         btn(p.pinned ? "已置顶" : "置顶", "star", {class: "btn quiet", "aria-pressed": String(p.pinned), onclick: () => upd({pinned: !p.pinned})}),
         btn("打开文件夹", "folder", {class: "btn quiet", onclick: () => api("/api/reveal", {pack: id, sub: ""}).catch(e => toast(e.message))}),
-        btn(p.archived ? "取消归档" : "归档", "archive", {class: "btn quiet", onclick: () => upd({archived: !p.archived})}))),
+        btn(p.archived ? "取消归档" : "归档", "archive", {class: "btn quiet", onclick: () => upd({archived: !p.archived})}),
+        btn("删除", "trash", {class: "btn quiet warn", title: "移到废纸篓，7 天内可以恢复", onclick: e => delPack(p, e.currentTarget)}))),
     p.failed.length ? h("div", {class: "banner"}, `有 ${p.failed.length} 份没提取成功：`, h("ul", {}, p.failed.map(f => h("li", {}, `${f.source}：${f.why}`)))) : null);
 }
 function paintAI(p){
@@ -1104,6 +1118,59 @@ document.addEventListener("keydown", e => {
   if (o && o !== p.items[i]){ const t = tab !== "raw" && !o["has_" + tab] ? "raw" : tab; location.hash = `#/read/${E(r.id)}/${o.sid}/${t}`; }
 });
 
+/* ---------- 删除复习包 / 废纸篓 ---------- */
+async function delPack(p, b){
+  if (b) b.disabled = true;
+  try {
+    const r = await api("/api/pack_delete", {id: p.id});
+    delete packCache[p.id]; S.packs = S.packs.filter(x => x.id !== p.id); S.trash = (S.trash || 0) + 1;
+    goHome();
+    toast(`「${p.name}」已移到废纸篓，7 天后自动删除`, {label: "撤销", run: () => restorePack(r.trash_id, p.name)});
+    poll();
+  } catch (e) { if (b) b.disabled = false; toast(e.message); }
+}
+async function restorePack(tid, name){
+  try {
+    const r = await api("/api/trash_restore", {id: tid});
+    await poll(); toast(`已恢复「${name}」`);
+    location.hash = "#/pack/" + E(r.pack);
+  } catch (e) { toast(e.message); }
+}
+function twoStep(label, sure, run){   // 彻底删除这种收不回来的操作：点第一下只是变成「再点一次」，4 秒内再点才做
+  const b = btn(label, "trash", {class: "btn quiet danger", onclick: async () => {
+    if (!b.classList.contains("sure")){
+      b.classList.add("sure"); put(b, icon("trash"), sure); clearTimeout(b._t);
+      b._t = setTimeout(() => { b.classList.remove("sure"); put(b, icon("trash"), label); }, 4000);
+      return;
+    }
+    clearTimeout(b._t); b.disabled = true;
+    try { await run(); } catch (e) { b.disabled = false; toast(e.message); }
+  }});
+  return b;
+}
+async function viewTrash(){
+  const tok = navToken;
+  if (!$main.firstChild) put($main, skeleton()); else loading(true);
+  let d;
+  try { d = await api("/api/trash"); }
+  catch (e) { if (tok === navToken) show([h("div", {class: "page narrow"}, h("div", {class: "blank"}, h("h2", {}, "打不开废纸篓"), h("p", {}, e.message)))]); return; }
+  if (tok !== navToken) return;
+  const done = async msg => { toast(msg); await poll(); if (tok === navToken) viewTrash(); };
+  const row = it => h("div", {class: "trash-row"},
+    h("div", {class: "grow"}, h("div", {class: "pk-t"}, h("span", {}, it.name)),
+      h("div", {class: "pk-s"}, `${it.n_items} 份材料，${fmtDate(it.deleted_at)}删除，${it.days_left} 天后彻底删除`)),
+    btn("恢复", "undo", {class: "btn", onclick: e => { e.currentTarget.disabled = true; restorePack(it.id, it.name); }}),
+    twoStep("彻底删除", "再点一次彻底删除", async () => { await api("/api/trash_purge", {id: it.id}); await done(`已彻底删除「${it.name}」`); }));
+  show([h("div", {class: "page narrow"},
+    h("div", {class: "pk-head"},
+      h("div", {class: "grow"}, h("div", {class: "pk-title"}, h("h1", {}, "废纸篓")),
+        h("div", {class: "pk-sub"}, `删掉的复习包在这里放 ${d.days} 天，到期自动彻底删除。`)),
+      d.items.length ? h("div", {class: "row"}, twoStep("清空废纸篓", `再点一次，${d.items.length} 个全部彻底删除`, async () => { await api("/api/trash_purge", {all: true}); await done("废纸篓已清空"); })) : null),
+    d.items.length ? h("div", {class: "trash-list"}, d.items.map(row))
+      : h("div", {class: "blank"}, h("h2", {}, "废纸篓是空的"), h("p", {}, "在复习包页点「删除」，复习包会先放到这里，7 天后才真正删掉。")))],
+    () => window.scrollTo(0, 0));
+}
+
 /* ---------- 路由与轮询 ---------- */
 function goHome(){
   const last = load("wg_last", null), live = S.packs.filter(p => !p.archived);
@@ -1121,6 +1188,7 @@ function render(){
   if (r.view === "pack") viewPack(r.id);
   else if (r.view === "read" || r.view === "doc") viewRead(r);
   else if (r.view === "new") viewNew();
+  else if (r.view === "trash") viewTrash();
   else if (booted) goHome(); else if (!$main.firstChild) put($main, boot());
 }
 async function poll(){
@@ -1150,7 +1218,10 @@ async function poll(){
           if (now && JSON.stringify(now) !== sh.sig) viewRead(r); }
       }
     }
-  } catch (e) { if (e !== 0) online = false; }
+  } catch (e) {
+    if (e !== 0 && !e.status) online = false;
+    else if (e.status === 404 && tok === navToken && ["pack", "read", "doc"].includes(r.view)) goHome();
+  }
   let nb = document.getElementById("net");
   if (online) nb?.remove();
   else if (!nb) document.body.append(h("p", {class: "banner net", id: "net", role: "alert"}, "连不上温故，它可能已经退出了。双击「温故」重新打开，这个页面会自己恢复。"));

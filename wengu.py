@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import html
 import json
 import os
@@ -56,7 +57,7 @@ MEDIA_EXT = {".mp4", ".mov", ".m4a", ".mp3", ".wav", ".webm", ".aac", ".flac", "
 DOC_EXT = {".pdf", ".pptx"}
 CONVERT_HINT = {".ppt": "PPTX 或 PDF", ".key": "PDF 或 PPTX", ".doc": "PDF", ".docx": "PDF", ".pages": "PDF"}
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 PORT = 8737
 SEC_RAW, SEC_REVIEW, SEC_GUIDE = "1_原文全文", "2_复习文档", "3_精读指引"
 TASK_FILE = "给AI的任务.md"
@@ -328,9 +329,29 @@ def parse_vtt(text: str) -> list[dict]:
     return segs
 
 
+LANG_NAMES = {"en": "英语", "zh": "中文", "ja": "日语", "ko": "韩语", "fr": "法语", "de": "德语", "es": "西班牙语",
+              "pt": "葡萄牙语", "it": "意大利语", "ru": "俄语", "ar": "阿拉伯语", "hi": "印地语", "vi": "越南语"}
+
+
+def spoken_language(info: dict) -> str:
+    """视频里实际说的语言，如 "en"；判断不出时返回 ""。
+    先看 YouTube 语音识别的原语言字幕轨（键名以 -orig 结尾，是按声音判断的）；没有才用视频标注的语言。
+    标注是上传者自己填的，可能不准，比如给日本学生的英语听力视频标成日语。"""
+    for k in info.get("automatic_captions") or {}:
+        if k.endswith("-orig"):
+            return k[: -len("-orig")].split("-")[0].lower()
+    return (info.get("language") or "").split("-")[0].lower()
+
+
 def pick_subtitle(info: dict) -> tuple[str, dict] | None:
-    """优先人工字幕（视频原语言 > 英文 > 任意），其次原语言自动字幕；不用自动翻译的字幕。"""
-    lang = (info.get("language") or "").split("-")[0]
+    """只用和视频所说语言一致的字幕：人工字幕优先，其次原语言自动字幕。
+    别的语言的字幕即使是人工的，也是翻译，拿来复习会和视频对不上；
+    判断不出视频说什么语言时返回 None，交给语音识别（它按声音判断语言）。
+    返回的说明带语言名，比如「人工字幕（英语）」，写进复习包的「文字来源」。"""
+    lang = spoken_language(info)
+    if not lang:
+        return None
+    name = LANG_NAMES.get(lang, lang)
 
     def best_fmt(tracks: list[dict]) -> dict | None:
         for ext in ("json3", "vtt"):
@@ -340,21 +361,19 @@ def pick_subtitle(info: dict) -> tuple[str, dict] | None:
         return None
 
     manual = {k: v for k, v in (info.get("subtitles") or {}).items() if k != "live_chat"}
-    order = [k for k in manual if lang and k.split("-")[0] == lang] + [k for k in manual if k.startswith("en")] + list(manual)
-    for k in order:
+    same = [k for k in manual if k.split("-")[0].lower() == lang]
+    for k in sorted(same, key=lambda k: k.lower() != lang):  # "en" 排在 "en-GB" 前面
         f = best_fmt(manual[k])
         if f:
-            return "人工字幕", f
+            return f"人工字幕（{name}）", f
 
+    # 自动字幕里除了原语言那一轨，其余都是机器翻译，不用
     auto = info.get("automatic_captions") or {}
-    order = [k for k in auto if k.endswith("-orig")]
-    order += [k for k in auto if lang and k == lang]
-    if not lang:
-        order += [k for k in auto if k in ("en", "en-US")]
+    order = [k for k in auto if k.endswith("-orig")] + [k for k in auto if k.lower() == lang]
     for k in order:
         f = best_fmt(auto[k])
         if f:
-            return "自动字幕", f
+            return f"自动字幕（{name}）", f
     return None
 
 
@@ -590,7 +609,9 @@ def expand_url(url: str) -> list[str]:
 def process_online(url: str) -> dict:
     key = cache_key("url", url)
     cached = cache_load(key)
-    if cached:
+    # v0.4.1 之前选字幕不看语言，可能拿了别的语言的翻译字幕（比如英语播客拿到日语字幕）。
+    # 那些缓存的说明是不带语言的「人工字幕」「自动字幕」：作废重取。语音识别的结果没问题，照用。
+    if cached and cached.get("method") not in ("人工字幕", "自动字幕"):
         return cached
 
     def meta_and_subs(ydl):
@@ -1207,6 +1228,111 @@ def list_packs() -> list[dict]:
     return sorted(out, key=lambda x: x["created"], reverse=True)
 
 
+# ---------------- 删除复习包 / 废纸篓 ----------------
+# 删除只是把整个文件夹移进「输出/废纸篓」，放满 7 天才真正删掉，这之前随时能恢复。
+# 这是温故唯一会真正删除文件的地方，而且只删用户自己在界面上删掉的复习包。
+TRASH_DAYS = 7
+TRASH_INFO = ".删除信息.json"   # 放在被删的复习包文件夹里：原来的文件夹名和删除时间
+
+
+def trash_root() -> Path:
+    return OUT_DIR / "废纸篓"
+
+
+def _free_name(folder: Path) -> Path:
+    base, n = folder, 2
+    while folder.exists():
+        folder, n = base.with_name(f"{base.name}_{n}"), n + 1
+    return folder
+
+
+def trash_dir(tid: str) -> Path:
+    root = trash_root().resolve()
+    p = (root / tid).resolve()
+    if p.parent != root or not (p / "pack.json").is_file():
+        raise FileNotFoundError(tid)
+    return p
+
+
+def _trash_info(d: Path) -> dict:
+    try:
+        info = json.loads((d / TRASH_INFO).read_text("utf-8"))
+        return {"name": str(info["name"]), "deleted_at": float(info["deleted_at"])}
+    except Exception:  # 说明文件丢了：按文件夹的修改时间算
+        return {"name": d.name, "deleted_at": d.stat().st_mtime}
+
+
+def delete_pack(pid: str) -> str:
+    base = pack_dir(pid)
+    trash_root().mkdir(parents=True, exist_ok=True)
+    dest = _free_name(trash_root() / base.name)
+    shutil.move(str(base), str(dest))
+    (dest / TRASH_INFO).write_text(json.dumps({"name": base.name, "deleted_at": time.time()}, ensure_ascii=False), "utf-8")
+    return dest.name
+
+
+def restore_pack(tid: str) -> str:
+    src = trash_dir(tid)
+    name = Path(_trash_info(src)["name"]).name
+    if not name or name.startswith(".") or name == trash_root().name:
+        name = src.name
+    dest = _free_name(OUT_DIR / name)
+    (src / TRASH_INFO).unlink(missing_ok=True)
+    shutil.move(str(src), str(dest))
+    return dest.name
+
+
+def _trashed() -> list[Path]:
+    root = trash_root()
+    return [d for d in root.iterdir() if d.is_dir() and (d / "pack.json").is_file()] if root.is_dir() else []
+
+
+def purge_trash(tid: str = "", everything: bool = False, now: float | None = None) -> int:
+    """彻底删除：指定的一个、全部，或者（都不指定时）放满 7 天的。返回删了几个。"""
+    if tid:
+        shutil.rmtree(trash_dir(tid))
+        return 1
+    now = time.time() if now is None else now
+    gone = 0
+    for d in _trashed():
+        if everything or now - _trash_info(d)["deleted_at"] >= TRASH_DAYS * 86400:
+            shutil.rmtree(d, ignore_errors=True)
+            gone += 1
+    return gone
+
+
+def list_trash(now: float | None = None) -> list[dict]:
+    now = time.time() if now is None else now
+    purge_trash(now=now)
+    out = []
+    for d in _trashed():
+        info = _trash_info(d)
+        try:
+            meta = read_meta(d)
+        except Exception:
+            meta = {}
+        left = TRASH_DAYS * 86400 - (now - info["deleted_at"])
+        out.append({"id": d.name, "name": meta.get("name") or info["name"], "n_items": len(meta.get("items", [])),
+                    "deleted_at": datetime.fromtimestamp(info["deleted_at"]).isoformat(timespec="minutes"),
+                    "days_left": max(1, math.ceil(left / 86400)), "_t": info["deleted_at"]})
+    out.sort(key=lambda x: x["_t"], reverse=True)
+    for x in out:
+        del x["_t"]
+    return out
+
+
+_purged_at = 0.0
+
+
+def trash_count() -> int:
+    """给侧栏显示数量；顺便每 10 分钟清一次到期的（温故一直开着时也会按时清）。"""
+    global _purged_at
+    if time.time() - _purged_at > 600:
+        _purged_at = time.time()
+        purge_trash()
+    return len(_trashed())
+
+
 MATH_RE = re.compile(
     r"(?<!\\)\$\$(.+?)(?<!\\)\$\$"                                              # $$ … $$
     r"|\\\[(.+?)\\\]"                                                           # \[ … \]
@@ -1315,9 +1441,12 @@ def make_handler(port: int):
                                   + [{"name": n, "size": 0, "ok": False, "why": w} for n, w in skipped],
                         "job": _job.snapshot() if _job else None,
                         "packs": list_packs(),
+                        "trash": trash_count(),
                     })
                 elif u.path == "/api/pack":
                     self._json(pack_info(q.get("id", "")))
+                elif u.path == "/api/trash":
+                    self._json({"days": TRASH_DAYS, "items": list_trash()})
                 elif u.path == "/api/doc":
                     f = pack_file(q.get("pack", ""), q.get("path", ""))
                     text = f.read_text("utf-8")
@@ -1376,6 +1505,17 @@ def make_handler(port: int):
                     self._json({"ok": True, "path": str(target)})
                 elif u.path == "/api/pack_update":
                     self._json({"ok": True, "pack": update_pack(body.get("id", ""), body)})
+                elif u.path == "/api/pack_delete":
+                    self._json({"ok": True, "trash_id": delete_pack(body.get("id", ""))})
+                elif u.path == "/api/trash_restore":
+                    self._json({"ok": True, "pack": restore_pack(body.get("id", ""))})
+                elif u.path == "/api/trash_purge":
+                    if body.get("all") is True:
+                        self._json({"ok": True, "gone": purge_trash(everything=True)})
+                    elif body.get("id"):
+                        self._json({"ok": True, "gone": purge_trash(tid=str(body["id"]))})
+                    else:
+                        raise FileNotFoundError("")
                 elif u.path == "/api/save_doc":
                     rel = save_ai_doc(body.get("pack", ""), body.get("section", ""), body.get("sid", ""), body.get("text", ""))
                     self._json({"ok": True, "file": rel})
@@ -1431,6 +1571,7 @@ def serve(open_browser: bool = True) -> None:
 def main() -> None:
     for d in (IN_DIR, OUT_DIR, CACHE_DIR):
         d.mkdir(parents=True, exist_ok=True)
+    purge_trash()  # 废纸篓里放满 7 天的复习包
     setup_tools()
     if "--cli" in sys.argv:
         main_cli()

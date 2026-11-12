@@ -79,19 +79,73 @@ this will be on the exam
     assert segs[-1]["start"] == 62.5
 
 
+def _tracks(url, ext="json3"):
+    return [{"ext": ext, "url": url}]
+
+
 def test_pick_subtitle_prefers_manual_then_original_auto():
     info = {"language": "en",
             "subtitles": {"live_chat": [{"ext": "json", "url": "x"}], "en": [{"ext": "vtt", "url": "manual-vtt"}, {"ext": "json3", "url": "manual-json3"}]},
-            "automatic_captions": {"en-orig": [{"ext": "json3", "url": "auto"}]}}
+            "automatic_captions": {"en-orig": _tracks("auto")}}
     kind, fmt = w.pick_subtitle(info)
-    assert kind == "人工字幕" and fmt["url"] == "manual-json3"
+    assert kind == "人工字幕（英语）" and fmt["url"] == "manual-json3"
 
     info2 = {"language": "en", "subtitles": {},
-             "automatic_captions": {"fr": [{"ext": "json3", "url": "translated"}], "en-orig": [{"ext": "vtt", "url": "orig"}]}}
+             "automatic_captions": {"fr": _tracks("translated"), "en-orig": _tracks("orig", "vtt")}}
     kind, fmt = w.pick_subtitle(info2)
-    assert kind == "自动字幕" and fmt["url"] == "orig"
+    assert kind == "自动字幕（英语）" and fmt["url"] == "orig"
 
     assert w.pick_subtitle({"subtitles": {}, "automatic_captions": {}}) is None
+
+
+def test_english_podcast_with_only_japanese_manual_subtitles_uses_english():
+    # 11 月 13 日的 bug：英语播客只有日语人工字幕（给日本学生的翻译），旧版拿了日语
+    info = {"language": None, "subtitles": {"ja": _tracks("ja-manual")},
+            "automatic_captions": {"ja": _tracks("ja-translated"), "en-orig": _tracks("en-asr"), "en": _tracks("en-asr2")}}
+    kind, fmt = w.pick_subtitle(info)
+    assert kind == "自动字幕（英语）" and fmt["url"] == "en-asr"
+
+
+def test_spoken_language_beats_what_the_uploader_labelled():
+    # 视频标成日语，但语音识别听出来是英语：按声音来
+    info = {"language": "ja", "subtitles": {"ja": _tracks("ja"), "en-GB": _tracks("en-gb"), "en": _tracks("en")},
+            "automatic_captions": {"en-orig": _tracks("asr")}}
+    kind, fmt = w.pick_subtitle(info)
+    assert kind == "人工字幕（英语）" and fmt["url"] == "en"  # "en" 排在 "en-GB" 前面
+
+
+def test_label_only_language_is_trusted_for_matching_tracks():
+    info = {"language": "zh-CN", "subtitles": {"en": _tracks("en"), "zh-Hans": _tracks("zh")}, "automatic_captions": {}}
+    kind, fmt = w.pick_subtitle(info)
+    assert kind == "人工字幕（中文）" and fmt["url"] == "zh"
+    # 标的是英语、只有日语人工字幕、没有语音识别：不拿翻译，交给语音识别
+    assert w.pick_subtitle({"language": "en", "subtitles": {"ja": _tracks("ja")}, "automatic_captions": {}}) is None
+
+
+def test_unknown_language_goes_to_speech_recognition_instead_of_guessing():
+    info = {"subtitles": {"en": _tracks("en"), "ja": _tracks("ja")}, "automatic_captions": {}}
+    assert w.spoken_language(info) == ""
+    assert w.pick_subtitle(info) is None
+
+
+def test_old_subtitle_cache_is_refetched_but_whisper_cache_is_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(w, "CACHE_DIR", tmp_path)
+
+    def ydl_called(*a, **k):
+        raise RuntimeError("重新取了")
+
+    monkeypatch.setattr(w, "run_ydl", ydl_called)
+    url_old, url_asr, url_new = (f"https://www.youtube.com/watch?v={v}" for v in ("old", "asr", "new"))
+    w.cache_save(w.cache_key("url", url_old), {"method": "人工字幕", "segments": [{"text": "こんにちは"}]})
+    w.cache_save(w.cache_key("url", url_asr), {"method": "Whisper 转写", "segments": []})
+    w.cache_save(w.cache_key("url", url_new), {"method": "人工字幕（英语）", "segments": []})
+    try:
+        w.process_online(url_old)
+        raise AssertionError("旧缓存应该作废")
+    except RuntimeError as e:
+        assert "重新取了" in str(e)
+    assert w.process_online(url_asr)["method"] == "Whisper 转写"
+    assert w.process_online(url_new)["method"] == "人工字幕（英语）"
 
 
 def test_format_segments_english_and_chinese():
@@ -649,85 +703,160 @@ def test_launcher_without_wengu_says_to_reinstall(tmp_path):
     assert "uv " not in calls.read_text()
 
 
-# ---------------- 一行安装（install.sh）----------------
+# ---------------- 一行安装 / 更新（install.sh）----------------
 import tarfile
 
 
-def _run_install(tmp_path, sys_apps=True, runs=1, before=None):
-    """在假的 macOS 环境里跑 install.sh：下载换成本地打包的源码，uv / defaults / open 等换成记录调用的替身。"""
-    home = tmp_path / "home"
-    fakes = home / ".local" / "bin"
-    fakes.mkdir(parents=True)
-    tgz = tmp_path / "main.tar.gz"
-    skip = {"输入", "输出", ".cache", "__pycache__", ".pytest_cache", ".git"}
-    with tarfile.open(tgz, "w:gz") as t:
-        for p in sorted(w.ROOT.rglob("*")):
-            rel = p.relative_to(w.ROOT)
-            if not skip & set(rel.parts) and p.is_file():
-                t.add(p, f"wengu-main/{rel}")
-    calls, dock = tmp_path / "calls.txt", tmp_path / "dock.txt"
-    calls.write_text("")
-    for name, body in {
-        "uname": 'echo Darwin\n',
-        "curl": 'case "$*" in *main.tar.gz*) cat "$FAKE_TGZ";; *api/ping*) exit 7;; *) echo "curl $*" >> "$FAKE_CALLS"; exit 1;; esac\n',
-        "uv": 'echo "uv $*" >> "$FAKE_CALLS"\n',
-        "defaults": 'case "$1" in export) cat "$FAKE_DOCK" 2>/dev/null;; write) echo "$5" >> "$FAKE_DOCK";; esac\n',
-        "killall": 'echo "killall $*" >> "$FAKE_CALLS"\n',
-        "open": 'echo "open $*" >> "$FAKE_CALLS"\n',
-        "ditto": 'cp -R "$1" "$2"\n',
-    }.items():
-        (fakes / name).write_text("#!/bin/bash\n" + body)
-        (fakes / name).chmod(0o755)
-    apps = tmp_path / "Applications"
-    if sys_apps:
-        apps.mkdir()
-    (home / "Desktop").mkdir()
-    if before:
-        before(home)
-    env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
-    env.update(HOME=str(home), PATH=f"{fakes}:/usr/bin:/bin", WENGU_SYS_APPS=str(apps),
-               FAKE_TGZ=str(tgz), FAKE_CALLS=str(calls), FAKE_DOCK=str(dock))
-    for _ in range(runs):
-        r = subprocess.run(["bash", str(w.ROOT / "install.sh")], env=env, capture_output=True, text=True, timeout=60)
-        assert r.returncode == 0, r.stdout + r.stderr
-    return home, apps, calls.read_text(), (dock.read_text() if dock.exists() else "")
+class FakeMac:
+    """在假的 macOS 里跑 install.sh：下载换成本地打包的源码，uv / defaults / open / 本机温故 等换成记录调用的替身。"""
+
+    def __init__(self, tmp_path, sys_apps=True):
+        self.tmp, self.home = tmp_path, tmp_path / "home"
+        self.apps, self.dest = tmp_path / "Applications", tmp_path / "home" / "温故"
+        self.calls, self.dock, self.tgz = tmp_path / "calls.txt", tmp_path / "dock.txt", tmp_path / "main.tar.gz"
+        fakes = self.home / ".local" / "bin"
+        fakes.mkdir(parents=True)
+        (self.home / "Desktop").mkdir()
+        if sys_apps:
+            self.apps.mkdir()
+        self.calls.write_text("")
+        for name, body in {
+            "uname": 'echo Darwin\n',
+            "curl": ('case "$*" in *main.tar.gz*) cat "$FAKE_TGZ";; *api/state*) [ -n "$FAKE_STATE" ] && echo "$FAKE_STATE" || exit 7;;'
+                     ' *api/quit*) echo "quit" >> "$FAKE_CALLS";; *) echo "curl $*" >> "$FAKE_CALLS"; exit 1;; esac\n'),
+            "uv": 'echo "uv $*" >> "$FAKE_CALLS"\n',
+            "defaults": 'case "$1" in export) cat "$FAKE_DOCK" 2>/dev/null;; write) echo "$5" >> "$FAKE_DOCK";; esac\n',
+            "killall": 'echo "killall $*" >> "$FAKE_CALLS"\n',
+            "open": 'echo "open $*" >> "$FAKE_CALLS"\n',
+            "ditto": 'mkdir -p "$2" && cp -R "$1/." "$2/"\n',  # ditto 是合并复制
+            "sleep": 'true\n',
+        }.items():
+            (fakes / name).write_text("#!/bin/bash\n" + body)
+            (fakes / name).chmod(0o755)
+        self.env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower() and k != "CODEX_HOME"}
+        self.env.update(HOME=str(self.home), PATH=f"{fakes}:/usr/bin:/bin", WENGU_SYS_APPS=str(self.apps),
+                        FAKE_TGZ=str(self.tgz), FAKE_CALLS=str(self.calls), FAKE_DOCK=str(self.dock), FAKE_STATE="")
+        self.release()
+
+    def release(self, extra=None, drop=()):
+        """把仓库打成 GitHub 那样的压缩包，可以多放或少放几个文件，模拟新旧版本。"""
+        skip = {"输入", "输出", ".cache", "__pycache__", ".pytest_cache", ".git"}
+        with tarfile.open(self.tgz, "w:gz") as t:
+            for p in sorted(w.ROOT.rglob("*")):
+                rel = p.relative_to(w.ROOT)
+                if not skip & set(rel.parts) and p.is_file() and str(rel) not in drop:
+                    t.add(p, f"wengu-main/{rel}")
+            for rel, text in (extra or {}).items():
+                f = self.tmp / "extra" / rel
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(text)
+                t.add(f, f"wengu-main/{rel}")
+
+    def install(self, state="", ok=True):
+        self.env["FAKE_STATE"] = state
+        r = subprocess.run(["bash", str(w.ROOT / "install.sh")], env=self.env, capture_output=True, text=True, timeout=60)
+        assert (r.returncode == 0) == ok, r.stdout + r.stderr
+        return r
+
+    def log(self):
+        return self.calls.read_text()
 
 
 def test_install_puts_icon_in_applications_desktop_and_dock(tmp_path):
-    home, apps, calls, dock = _run_install(tmp_path)
-    app = apps / "温故.app"
-    for a in (app, home / "Desktop" / "温故.app"):
+    mac = FakeMac(tmp_path)
+    mac.install()
+    app = mac.apps / "温故.app"
+    for a in (app, mac.home / "Desktop" / "温故.app"):
         assert os.access(a / "Contents" / "MacOS" / "wengu", os.X_OK)
         assert (a / "Contents" / "Resources" / "AppIcon.icns").exists()
-    assert (home / "温故" / "wengu.py").exists()
-    assert "uv sync --script wengu.py" in calls          # 组件在安装时装好
-    assert f"<string>{app}</string>" in dock and "killall Dock" in calls
-    assert calls.strip().endswith(f"open {app}")           # 最后打开的是「应用程序」里那份
+    assert (mac.dest / "wengu.py").exists() and os.access(mac.dest / "温故.command", os.X_OK)
+    assert "uv sync --script wengu.py" in mac.log()          # 组件在安装时装好
+    assert f"<string>{app}</string>" in mac.dock.read_text() and "killall Dock" in mac.log()
+    assert mac.log().strip().endswith(f"open {app}")           # 最后打开的是「应用程序」里那份
 
 
 def test_install_twice_does_not_add_a_second_dock_icon(tmp_path):
-    home, apps, _, dock = _run_install(tmp_path, runs=2)
-    assert dock.count("tile-data") == 1
-    assert (apps / "温故.app").exists() and (home / "Desktop" / "温故.app").exists()
+    mac = FakeMac(tmp_path)
+    mac.install()
+    mac.install()
+    assert mac.dock.read_text().count("tile-data") == 1
+    assert (mac.apps / "温故.app").exists() and (mac.home / "Desktop" / "温故.app").exists()
 
 
 def test_install_without_admin_uses_personal_applications(tmp_path):
-    home, apps, calls, dock = _run_install(tmp_path, sys_apps=False)
-    app = home / "Applications" / "温故.app"
-    assert app.exists() and not apps.exists()
-    assert f"<string>{app}</string>" in dock and calls.strip().endswith(f"open {app}")
+    mac = FakeMac(tmp_path, sys_apps=False)
+    mac.install()
+    app = mac.home / "Applications" / "温故.app"
+    assert app.exists() and not mac.apps.exists()
+    assert f"<string>{app}</string>" in mac.dock.read_text() and mac.log().strip().endswith(f"open {app}")
 
 
 def test_install_leaves_other_things_on_the_desktop_alone(tmp_path):
-    def before(home):
-        mine = home / "Desktop" / "温故.app" / "Contents"
-        mine.mkdir(parents=True)
-        (mine / "Info.plist").write_text("someone else's app")
-        (home / "Desktop" / "温故.command").write_text('#!/bin/bash\nexec "/Users/x/温故/温故.command"\n')
-    home, apps, _, _ = _run_install(tmp_path, before=before)
-    assert (home / "Desktop" / "温故.app" / "Contents" / "Info.plist").read_text() == "someone else's app"
-    assert not (home / "Desktop" / "温故.command").exists()  # 旧版放的启动器换掉了
-    assert (apps / "温故.app").exists()
+    mac = FakeMac(tmp_path)
+    mine = mac.home / "Desktop" / "温故.app" / "Contents"
+    mine.mkdir(parents=True)
+    (mine / "Info.plist").write_text("someone else's app")
+    (mac.home / "Desktop" / "温故.command").write_text('#!/bin/bash\nexec "/Users/x/温故/温故.command"\n')
+    mac.install()
+    assert (mine / "Info.plist").read_text() == "someone else's app"
+    assert not (mac.home / "Desktop" / "温故.command").exists()  # 旧版放的启动器换掉了
+    assert (mac.apps / "温故.app").exists()
+
+
+def test_update_removes_old_files_but_not_yours(tmp_path):
+    mac = FakeMac(tmp_path)
+    mac.release(extra={"旧功能.py": "old", "scripts/旧工具/跑.sh": "old"})
+    mac.install()
+    assert (mac.dest / "旧功能.py").exists()
+    (mac.dest / "我的笔记.md").write_text("mine")
+    (mac.dest / "输出" / "某门课").mkdir(parents=True)
+    (mac.dest / "输出" / "某门课" / "a.md").write_text("pack")
+    (mac.dest / ".cache" / "url_x.json").write_text("{}")
+    mac.release()  # 新版没有那两个旧文件
+    mac.install()
+    assert not (mac.dest / "旧功能.py").exists()
+    assert not (mac.dest / "scripts" / "旧工具").exists()       # 删空的文件夹也收掉
+    assert (mac.dest / "scripts" / "发布到GitHub.command").exists()
+    for kept in ("我的笔记.md", "输出/某门课/a.md", ".cache/url_x.json"):
+        assert (mac.dest / kept).exists(), kept
+    assert "旧功能.py" not in (mac.dest / ".cache" / "安装清单.txt").read_text()
+
+
+def test_update_waits_while_wengu_is_extracting(tmp_path):
+    mac = FakeMac(tmp_path)
+    r = mac.install(state='{"version": "0.4.0", "job": {"status": "running"}}', ok=False)
+    assert "正在提取材料" in r.stdout
+    assert "quit" not in mac.log() and not mac.dest.exists()
+
+
+def test_update_closes_running_wengu_then_reopens_it(tmp_path):
+    mac = FakeMac(tmp_path)
+    mac.install(state='{"version": "0.4.0", "job": {"status": "done"}}')
+    log = mac.log().split("\n")
+    assert log[0] == "quit" and log[-2] == f"open {mac.apps / '温故.app'}"
+
+
+def test_install_teaches_codex_to_update(tmp_path):
+    mac = FakeMac(tmp_path)
+    codex = mac.home / ".codex"
+    codex.mkdir()
+    (codex / "AGENTS.md").write_text("# 我的规则\n- 说中文\n")
+    mac.install()
+    mac.install()  # 再装一次也只有一段
+    text = (codex / "AGENTS.md").read_text()
+    assert text.startswith("# 我的规则\n- 说中文\n\n<!-- 温故：开始")
+    assert text.count("<!-- 温故：开始") == 1 and text.count("<!-- 温故：结束 -->") == 1
+    assert "「更新温故」" in text and "/wengu/main/install.sh | bash" in text
+    # 有 AGENTS.override.md 时 Codex 只读它，所以写进它
+    (codex / "AGENTS.override.md").write_text("override\n")
+    mac.install()
+    assert "「更新温故」" in (codex / "AGENTS.override.md").read_text()
+
+
+def test_install_without_codex_does_not_create_codex_files(tmp_path):
+    mac = FakeMac(tmp_path)
+    r = mac.install()
+    assert not (mac.home / ".codex").exists() and "更新温故" not in r.stdout
 
 
 def test_publish_refuses_to_publish_without_the_files_installs_need():
@@ -739,4 +868,120 @@ def test_publish_refuses_to_publish_without_the_files_installs_need():
     for f in required:
         assert (w.ROOT / f).exists(), f
     assert script.index("REQUIRED=") < script.index("rsync ")
-    assert 'SRC_APP/Contents/MacOS/wengu" ]' in install
+    assert '温故.app/Contents/MacOS/wengu" ]' in install  # 下载不完整就停
+
+
+# ---------------- 删除复习包 / 7 天废纸篓 ----------------
+import pytest
+
+
+def _make_pack(out, folder, name="课", items=2):
+    d = out / folder
+    d.mkdir(parents=True)
+    (d / "pack.json").write_text(json.dumps({"name": name, "created": "2026-11-13T02:00", "items": [{"sid": f"S{i}", "file": f"S{i}.md"} for i in range(items)]}, ensure_ascii=False))
+    (d / "1_原文全文").mkdir()
+    (d / "1_原文全文" / "S0.md").write_text("# S0")
+    return d
+
+
+@pytest.fixture
+def out(tmp_path, monkeypatch):
+    monkeypatch.setattr(w, "OUT_DIR", tmp_path / "输出")
+    monkeypatch.setattr(w, "IN_DIR", tmp_path / "输入")
+    (tmp_path / "输出").mkdir()
+    (tmp_path / "输入").mkdir()
+    return tmp_path / "输出"
+
+
+def test_delete_moves_pack_to_trash_and_restore_brings_it_back(out):
+    _make_pack(out, "复习包_1113_0229", "旧版播客", 1)
+    tid = w.delete_pack("复习包_1113_0229")
+    assert not (out / "复习包_1113_0229").exists()
+    assert [p["id"] for p in w.list_packs()] == []                  # 列表里不再出现
+    t = w.list_trash()
+    assert [(x["id"], x["name"], x["n_items"], x["days_left"]) for x in t] == [(tid, "旧版播客", 1, 7)]
+    assert (out / "废纸篓" / tid / "1_原文全文" / "S0.md").read_text() == "# S0"
+    pid = w.restore_pack(tid)
+    assert pid == "复习包_1113_0229" and (out / pid / "pack.json").exists()
+    assert not (out / pid / w.TRASH_INFO).exists() and w.list_trash() == []
+
+
+def test_restore_does_not_overwrite_a_pack_with_the_same_folder_name(out):
+    _make_pack(out, "复习包_1113_0229", "第一个")
+    tid = w.delete_pack("复习包_1113_0229")
+    _make_pack(out, "复习包_1113_0229", "后来同名的")
+    pid = w.restore_pack(tid)
+    assert pid == "复习包_1113_0229_2"
+    assert {p["name"] for p in w.list_packs()} == {"第一个", "后来同名的"}
+
+
+def test_deleting_two_packs_with_the_same_name_keeps_both_in_trash(out):
+    _make_pack(out, "复习包_1113_0229")
+    a = w.delete_pack("复习包_1113_0229")
+    _make_pack(out, "复习包_1113_0229")
+    b = w.delete_pack("复习包_1113_0229")
+    assert a != b and len(w.list_trash()) == 2
+
+
+def test_trash_empties_itself_after_seven_days(out):
+    _make_pack(out, "A")
+    _make_pack(out, "B")
+    w.delete_pack("A")
+    w.delete_pack("B")
+    now = time.time()
+    info = out / "废纸篓" / "A" / w.TRASH_INFO
+    info.write_text(json.dumps({"name": "A", "deleted_at": now - 7 * 86400 - 1}))   # 放满 7 天
+    left = w.list_trash(now=now)
+    assert [x["id"] for x in left] == ["B"] and not (out / "废纸篓" / "A").exists()
+    assert left[0]["days_left"] == 7
+
+
+def test_purge_one_or_everything_and_nothing_outside_the_trash(out):
+    _make_pack(out, "A")
+    _make_pack(out, "B")
+    _make_pack(out, "C")
+    w.delete_pack("A")
+    w.delete_pack("B")
+    assert w.purge_trash(tid="A") == 1 and [x["id"] for x in w.list_trash()] == ["B"]
+    assert w.purge_trash(everything=True) == 1 and w.list_trash() == []
+    assert (out / "C" / "pack.json").exists()                          # 没删的复习包不受影响
+    for bad in ("..", "../C", "C", "", "废纸篓"):
+        with pytest.raises(FileNotFoundError):
+            w.trash_dir(bad)
+    with pytest.raises(FileNotFoundError):
+        w.delete_pack("废纸篓")                                         # 废纸篓本身不是复习包
+
+
+def test_trash_routes_are_guarded(out):
+    import http.client
+    port = _free_port()
+    srv = ThreadingHTTPServer(("127.0.0.1", port), w.make_handler(port))
+    Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        _make_pack(out, "A")
+
+        def call(path, body=None, wengu=True):
+            c = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            hdr = {"Host": f"127.0.0.1:{port}"}
+            if wengu:
+                hdr["X-Wengu"] = "1"
+            if body is None:
+                c.request("GET", path, headers=hdr)
+            else:
+                c.request("POST", path, body=json.dumps(body), headers=hdr)
+            r = c.getresponse()
+            return r.status, json.loads(r.read() or b"{}")
+
+        assert call("/api/pack_delete", {"id": "A"}, wengu=False)[0] == 403   # 别的网站借浏览器发来的请求挡掉
+        assert (out / "A").exists()
+        st, j = call("/api/pack_delete", {"id": "A"})
+        assert st == 200 and j["trash_id"] == "A"
+        st, j = call("/api/state")
+        assert j["trash"] == 1
+        st, j = call("/api/trash")
+        assert j["days"] == 7 and [x["id"] for x in j["items"]] == ["A"]
+        assert call("/api/trash_purge", {})[0] == 404                        # 没说删哪个：什么都不删
+        st, j = call("/api/trash_restore", {"id": "A"})
+        assert st == 200 and j["pack"] == "A" and (out / "A" / "pack.json").exists()
+    finally:
+        srv.shutdown()
