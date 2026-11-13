@@ -33,6 +33,7 @@ import html
 import json
 import os
 import platform
+import random
 import re
 import shutil
 import subprocess
@@ -57,7 +58,7 @@ MEDIA_EXT = {".mp4", ".mov", ".m4a", ".mp3", ".wav", ".webm", ".aac", ".flac", "
 DOC_EXT = {".pdf", ".pptx"}
 CONVERT_HINT = {".ppt": "PPTX 或 PDF", ".key": "PDF 或 PPTX", ".doc": "PDF", ".docx": "PDF", ".pages": "PDF"}
 
-VERSION = "0.4.1"
+VERSION = "0.5.1"
 PORT = 8737
 SEC_RAW, SEC_REVIEW, SEC_GUIDE = "1_原文全文", "2_复习文档", "3_精读指引"
 TASK_FILE = "给AI的任务.md"
@@ -1170,6 +1171,144 @@ def read_meta(base: Path) -> dict:
     return json.loads((base / "pack.json").read_text("utf-8"))
 
 
+# ---------------- 开始页 ----------------
+# 开始页背景里慢慢漂过的句子：从最近几个复习包的原文里随机挑，看到的是自己的课。还没有复习包时用《论语》
+# 开始页背景里的名言：古今中外讲学习和求知的话，每句带出处。外国的是中文意译，几句拉丁文、希腊文留原文。
+# 只收出处确定的；网上流传但查不到原文的（很多「爱因斯坦说」）一律不收。
+QUOTES = [
+    ("学而时习之，不亦说乎？", "《论语·学而》"), ("温故而知新，可以为师矣。", "《论语·为政》"),
+    ("学而不思则罔，思而不学则殆。", "《论语·为政》"), ("知之为知之，不知为不知，是知也。", "《论语·为政》"),
+    ("三人行，必有我师焉。", "《论语·述而》"), ("敏而好学，不耻下问。", "《论语·公冶长》"),
+    ("知之者不如好之者，好之者不如乐之者。", "《论语·雍也》"), ("逝者如斯夫，不舍昼夜。", "《论语·子罕》"),
+    ("工欲善其事，必先利其器。", "《论语·卫灵公》"), ("吾日三省吾身。", "曾子，《论语·学而》"),
+    ("岁寒，然后知松柏之后凋也。", "《论语·子罕》"), ("默而识之，学而不厌，诲人不倦。", "《论语·述而》"),
+    ("不愤不启，不悱不发。", "《论语·述而》"), ("欲速则不达。", "《论语·子路》"),
+    ("尽信书，则不如无书。", "《孟子·尽心下》"), ("学问之道无他，求其放心而已矣。", "《孟子·告子上》"),
+    ("生于忧患而死于安乐。", "《孟子·告子下》"), ("穷则独善其身，达则兼善天下。", "《孟子·尽心上》"),
+    ("千里之行，始于足下。", "《老子》第六十四章"), ("知人者智，自知者明。", "《老子》第三十三章"),
+    ("上善若水。", "《老子》第八章"), ("大器晚成。", "《老子》第四十一章"),
+    ("合抱之木，生于毫末；九层之台，起于累土。", "《老子》第六十四章"), ("为学日益，为道日损。", "《老子》第四十八章"),
+    ("天下难事，必作于易；天下大事，必作于细。", "《老子》第六十三章"),
+    ("吾生也有涯，而知也无涯。", "《庄子·养生主》"), ("井蛙不可以语于海者，拘于虚也。", "《庄子·秋水》"),
+    ("子非鱼，安知鱼之乐？", "《庄子·秋水》"), ("天地有大美而不言。", "《庄子·知北游》"),
+    ("人生天地之间，若白驹之过郤，忽然而已。", "《庄子·知北游》"), ("水之积也不厚，则其负大舟也无力。", "《庄子·逍遥游》"),
+    ("不积跬步，无以至千里；不积小流，无以成江海。", "《荀子·劝学》"), ("锲而不舍，金石可镂。", "《荀子·劝学》"),
+    ("青，取之于蓝，而青于蓝。", "《荀子·劝学》"), ("学不可以已。", "《荀子·劝学》"),
+    ("吾尝终日而思矣，不如须臾之所学也。", "《荀子·劝学》"),
+    ("博学之，审问之，慎思之，明辨之，笃行之。", "《礼记·中庸》"), ("玉不琢，不成器；人不学，不知道。", "《礼记·学记》"),
+    ("学然后知不足，教然后知困。", "《礼记·学记》"), ("教学相长也。", "《礼记·学记》"),
+    ("苟日新，日日新，又日新。", "《礼记·大学》"), ("天行健，君子以自强不息。", "《周易·乾》"),
+    ("地势坤，君子以厚德载物。", "《周易·坤》"), ("如切如磋，如琢如磨。", "《诗经·卫风·淇奥》"),
+    ("志不强者智不达。", "《墨子·修身》"), ("千丈之堤，以蝼蚁之穴溃。", "《韩非子·喻老》"),
+    ("知彼知己，百战不殆。", "《孙子·谋攻》"), ("有志者事竟成也。", "《后汉书·耿弇传》"),
+    ("临渊羡鱼，不如退而结网。", "《汉书·董仲舒传》"),
+    ("少而好学，如日出之阳；壮而好学，如日中之光；老而好学，如炳烛之明。", "师旷，见刘向《说苑》"),
+    ("读书百遍而义自见。", "董遇，见《三国志》裴松之注"), ("究天人之际，通古今之变，成一家之言。", "司马迁《报任安书》"),
+    ("路漫漫其修远兮，吾将上下而求索。", "屈原《离骚》"), ("尺有所短，寸有所长。", "屈原《卜居》"),
+    ("非淡泊无以明志，非宁静无以致远。", "诸葛亮《诫子书》"), ("夫学须静也，才须学也。", "诸葛亮《诫子书》"),
+    ("盛年不重来，一日难再晨。", "陶渊明《杂诗》"), ("少壮不努力，老大徒伤悲。", "汉乐府《长歌行》"),
+    ("读书破万卷，下笔如有神。", "杜甫《奉赠韦左丞丈二十二韵》"), ("欲穷千里目，更上一层楼。", "王之涣《登鹳雀楼》"),
+    ("长风破浪会有时，直挂云帆济沧海。", "李白《行路难》"), ("业精于勤，荒于嬉；行成于思，毁于随。", "韩愈《进学解》"),
+    ("闻道有先后，术业有专攻。", "韩愈《师说》"), ("古之学者必有师。", "韩愈《师说》"),
+    ("不识庐山真面目，只缘身在此山中。", "苏轼《题西林壁》"), ("博观而约取，厚积而薄发。", "苏轼《稼说送张琥》"),
+    ("问渠那得清如许？为有源头活水来。", "朱熹《观书有感》"), ("读书之法，在循序而渐进，熟读而精思。", "朱熹"),
+    ("纸上得来终觉浅，绝知此事要躬行。", "陆游《冬夜读书示子聿》"),
+    ("为天地立心，为生民立命，为往圣继绝学，为万世开太平。", "张载"),
+    ("知是行之始，行是知之成。", "王阳明《传习录》"), ("破山中贼易，破心中贼难。", "王阳明《与杨仕德薛尚谦书》"),
+    ("咬定青山不放松，立根原在破岩中。", "郑燮《竹石》"),
+    ("Γνῶθι σεαυτόν.", "德尔斐神庙铭文：认识你自己"), ("未经省察的人生不值得过。", "苏格拉底，见柏拉图《申辩篇》"),
+    ("我不知道，也不以为自己知道。", "苏格拉底，见柏拉图《申辩篇》"), ("惊奇是哲学的开端。", "柏拉图《泰阿泰德篇》"),
+    ("学习就是回忆。", "柏拉图《美诺篇》"), ("求知是所有人的本性。", "亚里士多德《形而上学》"),
+    ("吾爱吾师，吾更爱真理。", "亚里士多德，《尼各马可伦理学》大意"), ("一只燕子造不成春天。", "亚里士多德《尼各马可伦理学》"),
+    ("人不能两次踏进同一条河流。", "赫拉克利特"), ("性格即命运。", "赫拉克利特"),
+    ("人是万物的尺度。", "普罗泰戈拉"), ("万物皆数。", "毕达哥拉斯学派"),
+    ("几何学里没有王者之路。", "欧几里得，据普罗克洛记载"), ("给我一个支点，我就能撬动地球。", "阿基米德，据帕普斯记载"),
+    ("Εὕρηκα!", "阿基米德，据维特鲁威记载：我找到了"), ("Ars longa, vita brevis.", "希波克拉底《格言》：技艺长久，人生短暂"),
+    ("心灵不是要被填满的容器，而是需要点燃的木柴。", "普鲁塔克《论听讲》"), ("历史是生活的老师。", "西塞罗《论演说家》"),
+    ("不是因为事情难，我们才不敢做；是因为我们不敢做，事情才难。", "塞涅卡《道德书简》"),
+    ("人生如戏，要紧的不是演多久，而是演得好不好。", "塞涅卡《道德书简》"), ("教别人的时候，我们自己也在学。", "塞涅卡《道德书简》"),
+    ("困扰人的不是事物本身，而是人对事物的看法。", "爱比克泰德《手册》"), ("心灵会染上你思想的颜色。", "马可·奥勒留《沉思录》"),
+    ("挡在路上的，就成了路。", "马可·奥勒留《沉思录》"), ("Festina lente.", "奥古斯都，据苏维托尼乌斯记载：慢慢地赶快"),
+    ("Per aspera ad astra.", "拉丁谚语：循着坎坷，抵达星辰"), ("Repetitio mater studiorum.", "拉丁谚语：重复是学习之母"),
+    ("Sapere aude.", "贺拉斯《书信集》，后来是康德的启蒙口号：敢于运用你的理智"),
+    ("宁要一个构造良好的头脑，不要一个塞满东西的头脑。", "蒙田《论儿童的教育》"), ("我知道什么？", "蒙田《随笔集》"),
+    ("读书使人充实，讨论使人机敏，写作使人精确。", "培根《论读书》"), ("知识就是力量。", "培根《宗教沉思录》"),
+    ("自然这本大书是用数学语言写成的。", "伽利略《试金者》"), ("我思故我在。", "笛卡尔《谈谈方法》"),
+    ("人只是一根苇草，但他是一根能思想的苇草。", "帕斯卡《思想录》"), ("人的全部尊严就在于思想。", "帕斯卡《思想录》"),
+    ("闲暇是哲学之母。", "霍布斯《利维坦》"), ("如果说我看得更远，那是因为我站在巨人的肩上。", "牛顿，致胡克的信"),
+    ("我不杜撰假说。", "牛顿《自然哲学的数学原理》"),
+    ("读书只给心灵提供知识的材料，思考才使读过的东西成为我们自己的。", "洛克《理解能力指导散论》"),
+    ("一切美好的事物，既难得，又稀少。", "斯宾诺莎《伦理学》"),
+    ("头上的星空，心中的道德律。", "康德《实践理性批判》"), ("思维无内容是空的，直观无概念是盲的。", "康德《纯粹理性批判》"),
+    ("密涅瓦的猫头鹰，要等黄昏到来才会起飞。", "黑格尔《法哲学原理》"),
+    ("理论是灰色的，生命之树常青。", "歌德《浮士德》"), ("知道还不够，还要应用；愿意还不够，还要去做。", "歌德"),
+    ("机会只青睐有准备的头脑。", "巴斯德"), ("无知比知识更容易让人自信。", "达尔文《人类的由来》"),
+    ("凡不能毁灭我的，使我更强大。", "尼采《偶像的黄昏》"), ("想象力比知识更重要。", "爱因斯坦，1929 年接受采访时"),
+    ("我的语言的界限，就是我的世界的界限。", "维特根斯坦《逻辑哲学论》"),
+]
+SENT_RE = re.compile(r"(?<=[.?!。？！])\s*")
+
+
+def start_lines(limit: int = 40) -> list[dict]:
+    """开始页背景里飘的句子：最近几个复习包讲稿里的句子（带出处，点一下回到原文那一刻），加上全部名言。"""
+    packs = []
+    if OUT_DIR.is_dir():
+        packs = sorted((d for d in OUT_DIR.iterdir() if d.is_dir() and (d / "pack.json").is_file()),
+                       key=lambda d: d.stat().st_mtime, reverse=True)[:6]
+    pool = []
+    for d in packs:
+        try:
+            meta = read_meta(d)
+            sids = {it["file"]: it["sid"] for it in meta.get("items", [])}
+        except Exception:
+            continue
+        name = meta.get("name") or d.name
+        for f in sorted((d / SEC_RAW).glob("*.md"))[:8]:
+            if f.name not in sids:
+                continue
+            try:
+                text = f.read_text("utf-8", errors="ignore")
+            except OSError:
+                continue
+            for line in text.splitlines():
+                if not line.strip() or line.lstrip().startswith(("#", "-", ">", "|", "*")):
+                    continue
+                ts = TS_LINK_RE.match(line.strip())
+                line = re.sub(r"\s+", " ", re.sub(r"\[[^\]]*\]\([^)]*\)", "", line)).strip()
+                at = clock_secs(ts.group(1)) if ts else None
+                pool += [{"t": x, "id": d.name, "name": name, "sid": sids[f.name], "at": at}
+                         for x in SENT_RE.split(line) if 16 <= len(x) <= 90]
+    random.shuffle(pool)
+    seen, out = set(), []
+    for x in pool:
+        if x["t"] not in seen and len(out) < limit:
+            seen.add(x["t"])
+            out.append(x)
+    quotes = [{"t": t, "by": by} for t, by in QUOTES]
+    random.shuffle(quotes)
+    return out + quotes
+
+
+TS_LINK_RE = re.compile(r"\[(\d{1,2}(?::\d{2}){1,2})\]\(")
+CLOCK_RE = re.compile(r"\d{1,2}(?::\d{2}){1,2}")
+
+
+def clock_secs(ts: str) -> int:
+    s = 0
+    for x in ts.split(":"):
+        s = s * 60 + int(x)
+    return s
+
+
+def cited_seconds(md: Path, upto: int) -> list[int]:
+    """复习文档里引用过的时间点（秒），材料表的讲课时间轴用它在对应位置画荧光笔记号。"""
+    try:
+        text = md.read_text("utf-8")
+    except OSError:
+        return []
+    return sorted({t for m in TS_LINK_RE.finditer(text) if (t := clock_secs(m.group(1))) <= upto})[:300]
+
+
 def pack_info(pid: str, full: bool = True) -> dict:
     base = pack_dir(pid)
     meta = read_meta(base)
@@ -1180,7 +1319,10 @@ def pack_info(pid: str, full: bool = True) -> dict:
     info = {"id": pid, "name": meta.get("name") or pid, "group": meta.get("group", ""),
             "pinned": bool(meta.get("pinned")), "archived": bool(meta.get("archived")),
             "created": meta.get("created", ""), "n_items": len(items),
-            "n_review": len(have[SEC_REVIEW] & names), "n_guide": len(have[SEC_GUIDE] & names)}
+            "n_review": len(have[SEC_REVIEW] & names), "n_guide": len(have[SEC_GUIDE] & names),
+            # 复习包库的卡片：前三份材料的标题，和每份材料写没写复习文档（1 是写了）
+            "peek": [[it.get("sid", ""), it.get("title", "")] for it in items[:3]],
+            "marks": "".join("1" if it["file"] in have[SEC_REVIEW] else "0" for it in items[:60])}
     if not full:
         return info
     task = base / TASK_FILE  # 写作要求跟着程序版本走：旧复习包打开时自动换成最新的
@@ -1195,10 +1337,18 @@ def pack_info(pid: str, full: bool = True) -> dict:
     merged = base / MERGED_FILE
     info.update(
         path=str(base), failed=meta.get("failed", []), extras=extras,
-        items=[dict(it, has_review=it["file"] in have[SEC_REVIEW], has_guide=it["file"] in have[SEC_GUIDE]) for it in items],
+        items=[_item_info(base, it, have) for it in items],
         merged_chars=merged.stat().st_size if merged.exists() else 0,
         sections={"raw": SEC_RAW, "review": SEC_REVIEW, "guide": SEC_GUIDE}, task_file=TASK_FILE, merged_file=MERGED_FILE)
     return info
+
+
+def _item_info(base: Path, it: dict, have: dict) -> dict:
+    d = dict(it, has_review=it["file"] in have[SEC_REVIEW], has_guide=it["file"] in have[SEC_GUIDE])
+    length = str(it.get("length", ""))
+    d["secs"] = clock_secs(length) if CLOCK_RE.fullmatch(length) else None   # PDF、PPT 是页数，没有时间轴
+    d["cites"] = cited_seconds(base / SEC_REVIEW / it["file"], d["secs"]) if d["has_review"] and d["secs"] else []
+    return d
 
 
 def update_pack(pid: str, changes: dict) -> dict:
@@ -1445,6 +1595,8 @@ def make_handler(port: int):
                     })
                 elif u.path == "/api/pack":
                     self._json(pack_info(q.get("id", "")))
+                elif u.path == "/api/start":
+                    self._json({"lines": start_lines()})
                 elif u.path == "/api/trash":
                     self._json({"days": TRASH_DAYS, "items": list_trash()})
                 elif u.path == "/api/doc":

@@ -985,3 +985,36 @@ def test_trash_routes_are_guarded(out):
         assert st == 200 and j["pack"] == "A" and (out / "A" / "pack.json").exists()
     finally:
         srv.shutdown()
+
+
+def test_pack_lists_the_moments_each_review_cites(out):
+    vid = {"kind": "视频", "title": "Lecture 2", "author": "", "duration": 3120, "source": "https://www.youtube.com/watch?v=abcdefgh",
+           "method": "人工字幕（英语）", "segments": [{"start": 5, "end": 9, "text": "hi"}]}
+    pdf = {"kind": "PDF", "title": "Slides", "length": "12 页", "pages": [{"n": 1, "text": "x"}], "method": "PDF 文字", "source": "slides.pdf"}
+    folder = w.new_pack_dir("课")
+    w.write_pack([vid, pdf], [], folder, None, "课")
+    f = next((folder / w.SEC_RAW).glob("S01_*.md")).name
+    (folder / w.SEC_REVIEW / f).write_text("See [02:15](u&t=135) and [10:42](u&t=642), again [02:15](u), late [1:59:59](u), text 03:00 is not a link\n", "utf-8")
+    items = w.pack_info(folder.name)["items"]
+    assert items[0]["secs"] == 3120 and items[0]["cites"] == [135, 642]   # 去重、排序，超出时长的不算
+    assert items[1]["secs"] is None and items[1]["cites"] == []
+
+
+def test_start_page_lines_come_from_your_own_transcripts(out):
+    quotes = w.start_lines()                                                      # 还没有复习包：只有名言，每句都有出处、不重复
+    assert len(quotes) >= 100 and all(x["by"] and "id" not in x for x in quotes)
+    assert len({x["t"] for x in quotes}) == len(quotes) and "温故而知新，可以为师矣。" in [x["t"] for x in quotes]
+    vid = {"kind": "视频", "title": "Lecture", "author": "", "duration": 600, "source": "https://www.youtube.com/watch?v=abcdefgh",
+           "method": "人工字幕（英语）", "segments": [{"start": 5 + i * 30, "end": 30 + i * 30,
+           "text": f"The standard error shrinks when the sample size number {i} grows. Short. This is the sentence about lecture {i}."} for i in range(20)]}
+    base = w.new_pack_dir("课")
+    w.write_pack([vid], [], base, None, "课")
+    got = w.start_lines()
+    lines = [x["t"] for x in got if "id" in x]                                     # 讲稿里的句子排在前面，名言跟在后面
+    assert len(lines) >= 12 and all(16 <= len(x) <= 90 for x in lines) and len(got) == len(lines) + len(w.QUOTES)
+    hit = next(x for x in got if "number 3 grows" in x["t"])                      # 每句带出处：点开回到原文那一秒
+    assert (hit["id"], hit["name"], hit["sid"], hit["at"]) == (base.name, "课", "S1", 95)
+    card = next(x for x in w.list_packs() if x["id"] == base.name)                # 复习包库的卡片：目录前几行和进度
+    assert card["peek"] == [["S1", "Lecture"]] and card["marks"] == "0"
+    assert not any("](" in x or "youtube" in x.lower() or x.startswith(("#", "-")) for x in lines)   # 没有链接、标题、元信息
+    assert any("standard error" in x for x in lines) and "Short." not in lines
